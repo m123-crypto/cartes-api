@@ -31,6 +31,17 @@ npm run migrate
 npm run start:dev             # http://localhost:3000/v1
 ```
 
+## Interface web
+
+Une première interface (mobile d'abord) est servie à la racine par l'API : après `npm run start:dev`, ouvrir http://localhost:3000.
+
+- Fichiers dans `web/` : HTML, CSS et JavaScript natifs, sans dépendance ni étape de compilation.
+- Parcours : inscription par code SMS et PIN, vérification d'identité, recharge et retrait mobile money, création et gestion des cartes (charger, décharger, geler, plafond, résilier), historique.
+- En bac à sable (`SANDBOX=true`), un bandeau « Mode test » s'affiche, le code SMS apparaît à l'écran et des boutons simulent la réponse de l'opérateur et les achats par carte.
+- En-têtes de sécurité (CSP stricte, sans style ni script en ligne) posés par `src/main.ts`.
+
+À savoir : la session est gardée dans le stockage du navigateur (jeton de rafraîchissement). Pour la production, préférer un cookie `HttpOnly` et ajouter la page sécurisée de l'émetteur (`frame-src`) à la CSP si l'affichage des numéros se fait dans une iframe.
+
 ## Tests
 
 ```bash

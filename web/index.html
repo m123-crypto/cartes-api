@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0E2A3B">
+  <meta name="description" content="Cartes de paiement virtuelles rechargeables par mobile money.">
+  <title>Cartes</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&display=swap">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div id="sandbox-strip" class="sandbox-strip" hidden>Mode test : aucun argent réel ne circule</div>
+  <main id="app" class="app" aria-live="polite">
+    <p class="boot">Chargement…</p>
+  </main>
+  <nav id="tabs" class="tabs" hidden aria-label="Navigation principale">
+    <a href="#/" data-tab="home">Accueil</a>
+    <a href="#/cartes" data-tab="cards">Cartes</a>
+    <a href="#/profil" data-tab="profile">Profil</a>
+  </nav>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <noscript>Activez JavaScript pour utiliser l'application.</noscript>
+</body>
+</html>
