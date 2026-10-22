@@ -1,5 +1,5 @@
-import { Controller, DynamicModule, Get, Module } from '@nestjs/common';
-import { AppConfig } from './config/config';
+import { Controller, DynamicModule, Get, Inject, Module } from '@nestjs/common';
+import { AppConfig, CONFIG } from './config/config';
 import { ConfigModule } from './config/config.module';
 import { DbModule } from './db/db.module';
 import { DbService } from './db/db.service';
@@ -14,12 +14,16 @@ import { SandboxModule } from './sandbox/sandbox.controller';
 
 @Controller('health')
 class HealthController {
-  constructor(private readonly db: DbService) {}
+  constructor(
+    private readonly db: DbService,
+    @Inject(CONFIG) private readonly cfg: AppConfig,
+  ) {}
 
+  /** État du service ; sandbox indique à l'interface d'afficher les simulateurs. */
   @Get()
   async health() {
     await this.db.query('select 1');
-    return { status: 'ok' };
+    return { status: 'ok', sandbox: this.cfg.SANDBOX };
   }
 }
 
