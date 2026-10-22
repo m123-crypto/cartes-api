@@ -51,18 +51,23 @@ export class MomoService {
       throw new DomainError('invalid_amount', `Montant entre ${AMOUNTS.topupMin} et ${AMOUNTS.topupMax} FCFA`, 400);
     }
     const { op, isNew } = await this.db.tx(async (c) => {
+      // Verrou d'abord : deux envois simultanés de la même clé sont sérialisés et le second
+      // renvoie l'opération du premier (au lieu d'un conflit 409).
+      const user = await this.lockUser(c, userId);
       const existing = await this.findByIdempotencyKey(c, userId, idempotencyKey);
       if (existing) return { op: existing, isNew: false };
+      this.assertActive(user);
 
-      const user = await this.lockUser(c, userId);
       const limits = tierLimits(user.kyc_tier);
       if (user.kyc_tier < 1) throw Errors.kycRequired(1);
       const monthTotal = await this.monthlyCollections(c, userId);
       if (monthTotal + input.amount > limits.monthlyTopups) {
         throw Errors.limitExceeded('monthly_topups', limits.monthlyTopups);
       }
-      const holdings = await this.ledger.userHoldings(c, userId);
-      if (holdings + input.amount > limits.maxHoldings) throw Errors.limitExceeded('max_holdings', limits.maxHoldings);
+      // Les recharges en attente comptent : sinon plusieurs recharges lancées avant la première
+      // confirmation dépasseraient ensemble le plafond de détention.
+      const holdings = (await this.ledger.userHoldings(c, userId)) + (await this.pendingCollectionsNet(c, userId));
+      if (holdings + input.amount - topupFee(input.amount) > limits.maxHoldings) throw Errors.limitExceeded('max_holdings', limits.maxHoldings);
 
       const msisdn = this.msisdn(input.msisdn ?? user.phone);
       const res = await c.query<OperationRow>(
@@ -97,10 +102,11 @@ export class MomoService {
       throw new DomainError('invalid_amount', `Retrait minimum : ${AMOUNTS.withdrawalMin} FCFA`, 400);
     }
     const { op, isNew } = await this.db.tx(async (c) => {
+      const user = await this.lockUser(c, userId);
       const existing = await this.findByIdempotencyKey(c, userId, idempotencyKey);
       if (existing) return { op: existing, isNew: false };
+      this.assertActive(user);
 
-      const user = await this.lockUser(c, userId);
       if (user.kyc_tier < 1) throw Errors.kycRequired(1);
       const msisdn = this.msisdn(input.msisdn ?? user.phone);
       const fee = withdrawalFee(input.amount);
@@ -269,8 +275,21 @@ export class MomoService {
     );
     const user = res.rows[0];
     if (!user) throw Errors.notFound('Utilisateur');
-    if (user.status !== 'active') throw new DomainError('account_inactive', 'Compte suspendu', 403);
     return user;
+  }
+
+  private assertActive(user: { status: string }) {
+    if (user.status !== 'active') throw new DomainError('account_inactive', 'Compte suspendu', 403);
+  }
+
+  /** Montant net (après frais) des recharges lancées mais pas encore confirmées. */
+  private async pendingCollectionsNet(c: Queryable, userId: string): Promise<number> {
+    const res = await c.query<{ total: number }>(
+      `select coalesce(sum(amount - fee), 0)::bigint as total from momo_operations
+        where user_id = $1 and direction = 'collection' and status = 'pending'`,
+      [userId],
+    );
+    return res.rows[0].total;
   }
 
   private async monthlyCollections(c: Queryable, userId: string): Promise<number> {

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { AppConfig, CONFIG } from '../config/config';
 import { signedHeaders } from '../common/hmac';
-import { Errors } from '../common/errors';
+import { DomainError, Errors } from '../common/errors';
 import { ZodPipe } from '../common/zod.pipe';
 import { DbService } from '../db/db.service';
 import { MomoModule } from '../momo/momo.module';
@@ -50,7 +50,8 @@ export class SandboxController {
   async completeMomo(@Param('reference') reference: string, @Body(new ZodPipe(Complete)) body: z.infer<typeof Complete>) {
     const raw = JSON.stringify({ reference, status: body.status, failureReason: body.failureReason });
     const event = this.momoProvider.parseWebhook(signedHeaders(this.cfg.MOMO_WEBHOOK_SECRET, raw), Buffer.from(raw));
-    return this.momo.handleWebhook(event!);
+    if (!event) throw new DomainError('invalid_event', 'Événement simulé invalide', 400);
+    return this.momo.handleWebhook(event);
   }
 
   /** Simule un paiement chez un marchand avec la carte. */
@@ -72,7 +73,8 @@ export class SandboxController {
       merchantCountry: body.merchantCountry,
     });
     const event = this.issuer.parseWebhook(signedHeaders(this.cfg.ISSUER_WEBHOOK_SECRET, raw), Buffer.from(raw));
-    const decision = await this.cards.authorize(event as Extract<typeof event, { type: 'authorization' }>);
+    if (event?.type !== 'authorization') throw new DomainError('invalid_event', 'Paiement simulé invalide (montant converti nul ?)', 400);
+    const decision = await this.cards.authorize(event);
     return { authorizationId, ...decision };
   }
 
@@ -82,7 +84,8 @@ export class SandboxController {
   async reverse(@Param('authorizationId') authorizationId: string) {
     const raw = JSON.stringify({ type: 'reversal', issuerAuthorizationId: authorizationId });
     const event = this.issuer.parseWebhook(signedHeaders(this.cfg.ISSUER_WEBHOOK_SECRET, raw), Buffer.from(raw));
-    return this.cards.reverse(event as Extract<typeof event, { type: 'reversal' }>);
+    if (event?.type !== 'reversal') throw new DomainError('invalid_event', 'Annulation simulée invalide', 400);
+    return this.cards.reverse(event);
   }
 }
 

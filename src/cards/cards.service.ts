@@ -88,6 +88,15 @@ export class CardsService {
 
     try {
       const card = await this.db.tx(async (c) => {
+        // Verrou utilisateur puis nouveau comptage : deux créations simultanées ne peuvent pas
+        // dépasser le nombre maximal de cartes actives (la vérification plus haut évite seulement
+        // un appel inutile à l'émetteur).
+        await c.query('select 1 from users where id = $1 for update', [userId]);
+        const recount = await c.query<{ n: number }>(
+          `select count(*)::int as n from cards where user_id = $1 and status <> 'terminated'`,
+          [userId],
+        );
+        if (recount.rows[0].n >= limits.maxActiveCards) throw Errors.limitExceeded('max_active_cards', limits.maxActiveCards);
         const accountId = await this.ledger.ensureAccount(c, cardAccountCode(cardId), 'liability', userId);
         const res = await c.query<CardRow>(
           `insert into cards (id, user_id, issuer, issuer_card_id, type, label, last4, expiry_month, expiry_year,
@@ -158,7 +167,17 @@ export class CardsService {
   /** Résiliation : la carte est désactivée chez l'émetteur et son solde revient au portefeuille. */
   async terminate(userId: string, cardId: string) {
     const card = await this.owned(this.db.pool, userId, cardId);
-    if (card.status !== 'terminated') await this.terminateCard(card);
+    if (card.status !== 'terminated') {
+      // D'abord chez l'émetteur : une carte marquée résiliée chez nous ne doit plus pouvoir payer.
+      await this.issuer.setStatus(card.issuer_card_id, 'terminated').catch((err) => {
+        this.logger.error(`résiliation refusée par l'émetteur ${card.id} : ${(err as Error).message}`);
+        throw Errors.providerUnavailable();
+      });
+      await this.db.tx((c) => this.closeCard(c, card));
+    } else {
+      // Déjà résiliée (usage unique) : rend un éventuel solde resté sur la carte.
+      await this.db.tx((c) => this.sweepCard(c, card));
+    }
     return this.get(userId, cardId);
   }
 
@@ -184,7 +203,9 @@ export class CardsService {
 
   private async transfer(userId: string, cardId: string, amount: number, key: string, way: 'load' | 'unload') {
     await this.db.tx(async (c) => {
-      const card = await this.owned(c, userId, cardId);
+      // Verrou sur la carte : un chargement ne peut pas se glisser pendant une résiliation
+      // (sinon l'argent resterait bloqué sur une carte résiliée).
+      const card = await this.owned(c, userId, cardId, true);
       if (card.status === 'terminated') throw new DomainError('card_terminated', 'Carte résiliée', 409);
       const wallet = await this.ledger.walletAccountId(c, userId);
       const [from, to] = way === 'load' ? [wallet, card.ledger_account_id] : [card.ledger_account_id, wallet];
@@ -215,7 +236,7 @@ export class CardsService {
         [req.issuerAuthorizationId],
       );
       if (prior.rows[0]) {
-        return { decision: toDecision(prior.rows[0].decision, prior.rows[0].decline_reason), card: null as CardRow | null };
+        return { decision: toDecision(prior.rows[0].decision, prior.rows[0].decline_reason), closed: null as CardRow | null };
       }
 
       const cardRes = await c.query<CardRow & { user_status: string }>(
@@ -278,13 +299,27 @@ export class CardsService {
           decline ? 'declined' : 'approved', decline, ledgerTransactionId,
         ],
       );
-      return { decision: decline ? { approved: false, reason: decline } : { approved: true }, card: card ?? null };
+
+      // Carte à usage unique : marquée résiliée DANS la transaction du premier paiement accepté
+      // (sa ligne est verrouillée), donc un second paiement simultané la voit résiliée et est refusé.
+      // Le solde restant est rendu au portefeuille juste après, dans une transaction séparée, pour
+      // ne pas verrouiller de compte supplémentaire ici (risque d'interblocage).
+      let closed: CardRow | null = null;
+      if (!decline && card?.type === 'single_use') {
+        await c.query(`update cards set status = 'terminated', terminated_at = now(), updated_at = now() where id = $1`, [card.id]);
+        closed = card;
+      }
+      return { decision: decline ? { approved: false, reason: decline } : { approved: true }, closed };
     });
 
-    // Carte à usage unique : résiliée après le premier paiement accepté, le reste revient au portefeuille.
-    if (result.decision.approved && result.card?.type === 'single_use') {
-      await this.terminateCard(result.card).catch((err) =>
-        this.logger.error(`résiliation après usage unique échouée ${result.card!.id} : ${(err as Error).message}`),
+    if (result.closed) {
+      const card = result.closed;
+      await this.issuer.setStatus(card.issuer_card_id, 'terminated').catch((err) =>
+        this.logger.error(`carte à usage unique ${card.id} à résilier manuellement chez l'émetteur : ${(err as Error).message}`),
+      );
+      // En cas d'échec, le solde reste sur la carte résiliée et une nouvelle demande de résiliation le rend.
+      await this.db.tx((c) => this.sweepCard(c, card)).catch((err) =>
+        this.logger.error(`solde de la carte ${card.id} non rendu au portefeuille : ${(err as Error).message}`),
       );
     }
     return result.decision;
@@ -304,8 +339,10 @@ export class CardsService {
       const auth = res.rows[0];
       if (!auth || auth.decision !== 'approved' || auth.reversed_at) return { reversed: false };
 
+      // Verrou sur la carte : une résiliation simultanée ne peut pas laisser le remboursement
+      // arriver sur une carte déjà vidée.
       const card = await c.query<{ user_id: string; status: string; ledger_account_id: string }>(
-        'select user_id, status, ledger_account_id from cards where id = $1',
+        'select user_id, status, ledger_account_id from cards where id = $1 for update',
         [auth.card_id],
       );
       const { user_id: userId, status, ledger_account_id: cardAccount } = card.rows[0];
@@ -351,31 +388,48 @@ export class CardsService {
 
   // --- interne ---------------------------------------------------------------
 
-  private async terminateCard(card: CardRow) {
-    await this.issuer.setStatus(card.issuer_card_id, 'terminated');
-    await this.db.tx(async (c) => {
-      const locked = await c.query<{ status: string }>('select status from cards where id = $1 for update', [card.id]);
-      if (locked.rows[0].status === 'terminated') return;
-      await c.query(`update cards set status = 'terminated', terminated_at = now(), updated_at = now() where id = $1`, [card.id]);
-      const balance = await this.ledger.balance(c, card.ledger_account_id);
-      if (balance > 0) {
-        await this.ledger.post(c, {
-          kind: 'card_unload',
-          idempotencyKey: `card-close:${card.id}`,
-          userId: card.user_id,
-          referenceId: card.id,
-          metadata: { reason: 'terminated' },
-          postings: [
-            { accountId: card.ledger_account_id, direction: 'D', amount: balance },
-            { accountId: await this.ledger.walletAccountId(c, card.user_id), direction: 'C', amount: balance },
-          ],
-        });
-      }
-    });
+  /** Marque la carte résiliée et rend son solde au portefeuille, dans la transaction c. */
+  private async closeCard(c: Queryable, card: CardRow) {
+    await c.query('select 1 from cards where id = $1 for update', [card.id]);
+    await c.query(
+      `update cards set status = 'terminated', terminated_at = now(), updated_at = now() where id = $1 and status <> 'terminated'`,
+      [card.id],
+    );
+    await this.sweepCard(c, card);
   }
 
-  private async owned(c: Queryable, userId: string, cardId: string): Promise<CardRow> {
-    const res = await c.query<CardRow>(`select ${CARD_COLUMNS} from cards c where c.id = $1 and c.user_id = $2`, [cardId, userId]);
+  /**
+   * Rend au portefeuille le solde d'une carte résiliée. Sans effet si le solde est nul : peut donc
+   * être rejoué sans risque (une carte résiliée ne reçoit plus rien, son solde ne peut que baisser).
+   */
+  private async sweepCard(c: Queryable, card: CardRow) {
+    // Carte verrouillée (chargements et remboursements la verrouillent aussi), puis solde lu sous verrou.
+    const locked = await c.query<{ status: string }>('select status from cards where id = $1 for update', [card.id]);
+    if (locked.rows[0].status !== 'terminated') return;
+    const res = await c.query<{ balance: number }>('select balance from ledger_accounts where id = $1 for update', [
+      card.ledger_account_id,
+    ]);
+    const balance = res.rows[0].balance;
+    if (balance > 0) {
+      await this.ledger.post(c, {
+        kind: 'card_unload',
+        idempotencyKey: `card-close:${card.id}`,
+        userId: card.user_id,
+        referenceId: card.id,
+        metadata: { reason: 'terminated' },
+        postings: [
+          { accountId: card.ledger_account_id, direction: 'D', amount: balance },
+          { accountId: await this.ledger.walletAccountId(c, card.user_id), direction: 'C', amount: balance },
+        ],
+      });
+    }
+  }
+
+  private async owned(c: Queryable, userId: string, cardId: string, lock = false): Promise<CardRow> {
+    const res = await c.query<CardRow>(
+      `select ${CARD_COLUMNS} from cards c where c.id = $1 and c.user_id = $2${lock ? ' for update' : ''}`,
+      [cardId, userId],
+    );
     if (!res.rows[0]) throw Errors.notFound('Carte');
     return res.rows[0];
   }
