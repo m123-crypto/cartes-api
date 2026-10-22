@@ -3,13 +3,16 @@ import { z } from 'zod';
 import { AuthUser, CurrentUser } from '../common/decorators';
 import { ZodPipe } from '../common/zod.pipe';
 import { JwtAuthGuard } from '../auth/guards';
-import { UsersService } from './users.service';
+import { isRealDate, UsersService } from './users.service';
 
 const name = z.string().trim().min(1).max(80);
 const Tier1 = z.object({
   firstName: name,
   lastName: name,
-  birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'format AAAA-MM-JJ'),
+  birthDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'format AAAA-MM-JJ')
+    .refine(isRealDate, 'date inexistante'),
 });
 const Documents = z.object({
   tier: z.union([z.literal(2), z.literal(3)]),

@@ -61,12 +61,17 @@ export class UsersService {
     if (ageInYears(input.birthDate) < 18) {
       throw new DomainError('underage', 'Le service est réservé aux personnes majeures', 422);
     }
-    await this.db.query(
+    // Une identité vérifiée par pièce (palier 2 et plus) ne peut plus être modifiée par déclaration.
+    const updated = await this.db.one(
       `update users set first_name = $2, last_name = $3, birth_date = $4,
               kyc_tier = greatest(kyc_tier, 1), updated_at = now()
-        where id = $1`,
+        where id = $1 and kyc_tier < 2
+        returning id`,
       [userId, input.firstName, input.lastName, input.birthDate],
     );
+    if (!updated) {
+      throw new DomainError('identity_locked', 'Identité déjà vérifiée : contactez le support pour la modifier', 409);
+    }
     return this.profile(userId);
   }
 
@@ -96,6 +101,14 @@ export class UsersService {
     if (!row) throw new DomainError('kyc_pending', 'Une vérification est déjà en cours pour ce niveau', 409);
     return { submissionId: row.id, status: 'pending' };
   }
+}
+
+/** Vrai si 'AAAA-MM-JJ' désigne un jour qui existe (refuse 2001-02-30, 1995-13-01…). */
+export function isRealDate(isoDate: string): boolean {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  if (!y || y < 1900) return false;
+  const date = new Date(Date.UTC(y, m - 1, d));
+  return date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d;
 }
 
 export function ageInYears(isoDate: string, today = new Date()): number {

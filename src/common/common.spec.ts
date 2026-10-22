@@ -3,7 +3,7 @@ import { bps, fxFee, topupFee, withdrawalFee, tierLimits } from './pricing';
 import { sign, signedHeaders, verifySignature } from './hmac';
 import { pinWeakness } from '../auth/pin';
 import { validatePostings } from '../ledger/ledger.service';
-import { ageInYears } from '../users/users.service';
+import { ageInYears, isRealDate } from '../users/users.service';
 
 describe('normalizePhone', () => {
   it.each([
@@ -85,4 +85,9 @@ describe('ageInYears', () => {
     expect(ageInYears('2008-10-22', today)).toBe(18);
     expect(ageInYears('2008-10-23', today)).toBe(17);
   });
+});
+
+describe('isRealDate', () => {
+  it.each(['1995-04-12', '2000-02-29'])('accepte %s', (d) => expect(isRealDate(d)).toBe(true));
+  it.each(['2001-02-29', '1995-13-01', '1995-04-31', '0000-01-01', '1850-01-01'])('refuse %s', (d) => expect(isRealDate(d)).toBe(false));
 });

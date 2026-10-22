@@ -114,6 +114,15 @@ describe('authentification', () => {
     expect(res.body.error).toBe('pin_locked');
   });
 
+  it('verrouille l’identité après vérification par pièce et refuse une date inexistante', async () => {
+    const verified = await signUp(2);
+    const locked = await http.post('/v1/kyc/tier1').set(verified.auth).send({ firstName: 'Autre', lastName: 'Nom', birthDate: '1990-01-01' }).expect(409);
+    expect(locked.body.error).toBe('identity_locked');
+
+    const u = await signUp(1);
+    await http.post('/v1/kyc/tier1').set(u.auth).send({ firstName: 'Awa', lastName: 'Diop', birthDate: '2001-02-30' }).expect(400);
+  });
+
   it('refuse un PIN trop simple et un mauvais code OTP', async () => {
     const otp = await http.post('/v1/auth/otp/request').send({ phone: '+221770000999' }).expect(200);
     const wrong = otp.body.devCode === '000001' ? '000002' : '000001';
@@ -165,6 +174,25 @@ describe('recharge mobile money', () => {
     const res = await http.post('/v1/topups').set(u.auth).set('Idempotency-Key', key()).send({ operator: 'wave', amount: 300_000 }).expect(422);
     expect(res.body.error).toBe('limit_exceeded');
   });
+
+  it('compte les recharges en attente dans le plafond de détention', async () => {
+    const u = await signUp(1); // palier 1 : 200 000 FCFA détenus au maximum
+    await http.post('/v1/topups').set(u.auth).set('Idempotency-Key', key()).send({ operator: 'wave', amount: 150_000 }).expect(201);
+    // La première n'est pas encore confirmée : la seconde dépasserait le plafond une fois les deux créditées.
+    const res = await http.post('/v1/topups').set(u.auth).set('Idempotency-Key', key()).send({ operator: 'wave', amount: 150_000 }).expect(422);
+    expect(res.body).toMatchObject({ error: 'limit_exceeded', details: { limit: 'max_holdings' } });
+  });
+
+  it('même clé envoyée deux fois en même temps = une seule opération', async () => {
+    const u = await signUp();
+    const k = key();
+    const [a, b] = await Promise.all([
+      http.post('/v1/topups').set(u.auth).set('Idempotency-Key', k).send({ operator: 'wave', amount: 1000 }),
+      http.post('/v1/topups').set(u.auth).set('Idempotency-Key', k).send({ operator: 'wave', amount: 1000 }),
+    ]);
+    expect([a.status, b.status]).toEqual([201, 201]);
+    expect(b.body.id).toBe(a.body.id);
+  });
 });
 
 describe('cartes', () => {
@@ -214,6 +242,35 @@ describe('cartes', () => {
     expect(detail.body).toMatchObject({ status: 'terminated', balance: 0 });
     // 9 900 - 300 (création) - 5 000 + 2 000 rendus = 6 600
     expect((await wallet(u.auth)).balance).toBe(6600);
+    // Second paiement : refusé, la carte est déjà résiliée.
+    const second = await http.post(`/v1/sandbox/cards/${card.body.id}/purchase`).send({ amount: 500 }).expect(200);
+    expect(second.body).toMatchObject({ approved: false, reason: 'card_terminated' });
+    // Nouvelle demande de résiliation : sans effet, sans erreur.
+    await http.delete(`/v1/cards/${card.body.id}`).set(u.auth).expect(200);
+    expect((await wallet(u.auth)).balance).toBe(6600);
+    await ledgerOk();
+  });
+
+  it('carte à usage unique : deux paiements simultanés, un seul accepté', async () => {
+    const u = await signUp();
+    await topUp(u.auth, 10_000);
+    const card = await http.post('/v1/cards').set(u.auth).set('Idempotency-Key', key()).send({ type: 'single_use' }).expect(201);
+    await http.post(`/v1/cards/${card.body.id}/load`).set(u.auth).set('Idempotency-Key', key()).send({ amount: 5000 }).expect(200);
+    const results = await Promise.all(
+      Array.from({ length: 3 }, () => http.post(`/v1/sandbox/cards/${card.body.id}/purchase`).send({ amount: 1000 }).expect(200)),
+    );
+    expect(results.filter((r) => r.body.approved)).toHaveLength(1);
+    await ledgerOk();
+  });
+
+  it('plafond du nombre de cartes actives, même en création simultanée', async () => {
+    const u = await signUp(1); // palier 1 : 2 cartes à usage unique au maximum
+    await topUp(u.auth, 10_000);
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => http.post('/v1/cards').set(u.auth).set('Idempotency-Key', key()).send({ type: 'single_use' })),
+    );
+    expect(results.filter((r) => r.status === 201)).toHaveLength(2);
+    expect(results.filter((r) => r.status === 422).every((r) => r.body.error === 'limit_exceeded')).toBe(true);
     await ledgerOk();
   });
 
